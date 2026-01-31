@@ -196,10 +196,13 @@ class VoiceTerminalApp(rumps.App):
                 text = transcript.strip()
 
                 if text:
-                    # Type the transcribed text
-                    # Small delay to ensure focus is on target window
-                    pyautogui.PAUSE = 0.01
-                    pyautogui.write(text, interval=0.01)
+                    # Copy to clipboard and paste (instant vs character-by-character)
+                    subprocess.run(['pbcopy'], input=text.encode('utf-8'), check=True)
+                    # Use AppleScript for reliable Cmd+V on macOS
+                    subprocess.run([
+                        'osascript', '-e',
+                        'tell application "System Events" to keystroke "v" using command down'
+                    ], check=True)
 
                     rumps.notification(
                         title="Voice Terminal",
