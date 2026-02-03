@@ -2,7 +2,8 @@
 """
 Voice Terminal - A macOS menubar app for voice-to-text in any application.
 
-Press Cmd+Shift+V to start recording, release to transcribe and type.
+Mode 1: Press Cmd+Shift+Z to transcribe speech directly.
+Mode 2: Press Cmd+Shift+A to send clipboard + speech to Claude, paste response.
 """
 
 import io
@@ -13,7 +14,6 @@ import threading
 import wave
 
 import numpy as np
-import pyautogui
 import rumps
 import sounddevice as sd
 from dotenv import load_dotenv
@@ -26,11 +26,28 @@ def play_sound(sound_name):
     sound_path = f"/System/Library/Sounds/{sound_name}.aiff"
     subprocess.Popen(["afplay", sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+
+def get_clipboard():
+    """Read current clipboard contents."""
+    result = subprocess.run(['pbpaste'], capture_output=True, text=True)
+    return result.stdout
+
+
+def set_clipboard_and_paste(text):
+    """Copy text to clipboard and paste it."""
+    subprocess.run(['pbcopy'], input=text.encode('utf-8'), check=True)
+    subprocess.run([
+        'osascript', '-e',
+        'tell application "System Events" to keystroke "v" using command down'
+    ], check=True)
+
+
 # Load environment variables from .env file
 load_dotenv()
 
 # Configuration
-HOTKEY = {keyboard.Key.cmd, keyboard.Key.shift, keyboard.KeyCode.from_char('z')}
+HOTKEY_TRANSCRIBE = {keyboard.Key.cmd, keyboard.Key.shift, keyboard.KeyCode.from_char('z')}
+HOTKEY_CLAUDE = {keyboard.Key.cmd, keyboard.Key.shift, keyboard.KeyCode.from_char('a')}
 SAMPLE_RATE = 16000  # Whisper expects 16kHz
 CHANNELS = 1
 
@@ -44,8 +61,10 @@ class VoiceTerminalApp(rumps.App):
         self.audio_data = []
         self.current_keys = set()
         self.stream = None
+        self.current_mode = None  # 'transcribe' or 'claude'
+        self.clipboard_context = None  # Stored clipboard for claude mode
 
-        # OpenAI client
+        # OpenAI client (for Whisper)
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             rumps.alert(
@@ -53,13 +72,24 @@ class VoiceTerminalApp(rumps.App):
                 message="Please set OPENAI_API_KEY environment variable.\n\n"
                         "export OPENAI_API_KEY='your-key-here'"
             )
-        self.client = OpenAI(api_key=api_key) if api_key else None
+        self.whisper_client = OpenAI(api_key=api_key) if api_key else None
+
+        # LLM client (for Claude mode)
+        llm_api_key = os.environ.get("LLM_API_KEY")
+        llm_base_url = os.environ.get("LLM_BASE_URL")
+        self.llm_model = os.environ.get("LLM_MODEL", "claude-opus-4-5-20250514")
+
+        if llm_api_key and llm_base_url and llm_api_key != "your-llm-api-key-here":
+            self.llm_client = OpenAI(api_key=llm_api_key, base_url=llm_base_url)
+        else:
+            self.llm_client = None
 
         # Menu items
         self.menu = [
             rumps.MenuItem("Status: Ready", callback=None),
             None,  # Separator
-            rumps.MenuItem("Hotkey: Cmd+Shift+Z", callback=None),
+            rumps.MenuItem("Cmd+Shift+Z: Transcribe", callback=None),
+            rumps.MenuItem("Cmd+Shift+A: Ask Claude", callback=None),
             None,
         ]
 
@@ -74,21 +104,29 @@ class VoiceTerminalApp(rumps.App):
         """Handle key press events."""
         self.current_keys.add(key)
 
-        # Check if hotkey combination is pressed
-        if self.check_hotkey() and not self.recording:
-            self.start_recording()
+        # Check which hotkey combination is pressed
+        if not self.recording:
+            if self.check_hotkey(HOTKEY_TRANSCRIBE):
+                self.current_mode = 'transcribe'
+                self.start_recording()
+            elif self.check_hotkey(HOTKEY_CLAUDE):
+                self.current_mode = 'claude'
+                # Capture clipboard before recording
+                self.clipboard_context = get_clipboard()
+                self.start_recording()
 
     def on_key_release(self, key):
         """Handle key release events."""
         # If any hotkey key is released while recording, stop
-        if self.recording and key in HOTKEY:
-            self.stop_recording()
+        if self.recording:
+            if key in HOTKEY_TRANSCRIBE or key in HOTKEY_CLAUDE:
+                self.stop_recording()
 
         # Remove key from current set
         self.current_keys.discard(key)
 
-    def check_hotkey(self):
-        """Check if the hotkey combination is currently pressed."""
+    def check_hotkey(self, hotkey):
+        """Check if a specific hotkey combination is currently pressed."""
         # Normalize keys for comparison
         normalized_current = set()
         for k in self.current_keys:
@@ -97,11 +135,11 @@ class VoiceTerminalApp(rumps.App):
             else:
                 normalized_current.add(k)
 
-        return HOTKEY.issubset(normalized_current)
+        return hotkey.issubset(normalized_current)
 
     def start_recording(self):
         """Start recording audio."""
-        if not self.client:
+        if not self.whisper_client:
             rumps.notification(
                 title="Voice Terminal",
                 subtitle="Error",
@@ -109,10 +147,24 @@ class VoiceTerminalApp(rumps.App):
             )
             return
 
+        if self.current_mode == 'claude' and not self.llm_client:
+            rumps.notification(
+                title="Voice Terminal",
+                subtitle="Error",
+                message="LLM API not configured. Set LLM_API_KEY and LLM_BASE_URL in .env"
+            )
+            return
+
         self.recording = True
         self.audio_data = []
-        self.title = "🔴"  # Red circle indicates recording
-        self.menu["Status: Ready"].title = "Status: Recording..."
+
+        # Different visual feedback per mode
+        if self.current_mode == 'transcribe':
+            self.title = "🔴"
+            self.menu["Status: Ready"].title = "Status: Recording..."
+        else:  # claude mode
+            self.title = "🟣"
+            self.menu["Status: Ready"].title = "Status: Recording (Claude)..."
 
         # Start audio stream
         def audio_callback(indata, frames, time, status):
@@ -130,11 +182,19 @@ class VoiceTerminalApp(rumps.App):
         # Audio feedback - recording started
         play_sound("Tink")
 
-        rumps.notification(
-            title="Voice Terminal",
-            subtitle="Recording",
-            message="Speak now... Release hotkey when done."
-        )
+        if self.current_mode == 'transcribe':
+            rumps.notification(
+                title="Voice Terminal",
+                subtitle="Recording",
+                message="Speak now... Release hotkey when done."
+            )
+        else:
+            context_preview = self.clipboard_context[:30] + "..." if len(self.clipboard_context) > 30 else self.clipboard_context
+            rumps.notification(
+                title="Voice Terminal",
+                subtitle="Recording (Claude Mode)",
+                message=f"Context: {context_preview or '(empty)'}"
+            )
 
     def stop_recording(self):
         """Stop recording and process audio."""
@@ -142,8 +202,14 @@ class VoiceTerminalApp(rumps.App):
             return
 
         self.recording = False
-        self.title = "⏳"  # Hourglass indicates processing
-        self.menu["Status: Ready"].title = "Status: Transcribing..."
+
+        # Different visual feedback per mode
+        if self.current_mode == 'transcribe':
+            self.title = "⏳"
+            self.menu["Status: Ready"].title = "Status: Transcribing..."
+        else:
+            self.title = "🤖"
+            self.menu["Status: Ready"].title = "Status: Asking Claude..."
 
         # Audio feedback - recording stopped
         play_sound("Pop")
@@ -158,7 +224,7 @@ class VoiceTerminalApp(rumps.App):
         threading.Thread(target=self.process_audio, daemon=True).start()
 
     def process_audio(self):
-        """Process recorded audio: transcribe and type."""
+        """Process recorded audio: transcribe and optionally send to Claude."""
         try:
             if not self.audio_data:
                 self.reset_status()
@@ -187,7 +253,7 @@ class VoiceTerminalApp(rumps.App):
             try:
                 # Transcribe with Whisper
                 with open(tmp_path, "rb") as audio_file:
-                    transcript = self.client.audio.transcriptions.create(
+                    transcript = self.whisper_client.audio.transcriptions.create(
                         model="whisper-1",
                         file=audio_file,
                         response_format="text"
@@ -196,19 +262,23 @@ class VoiceTerminalApp(rumps.App):
                 text = transcript.strip()
 
                 if text:
-                    # Copy to clipboard and paste (instant vs character-by-character)
-                    subprocess.run(['pbcopy'], input=text.encode('utf-8'), check=True)
-                    # Use AppleScript for reliable Cmd+V on macOS
-                    subprocess.run([
-                        'osascript', '-e',
-                        'tell application "System Events" to keystroke "v" using command down'
-                    ], check=True)
-
-                    rumps.notification(
-                        title="Voice Terminal",
-                        subtitle="Typed",
-                        message=text[:50] + "..." if len(text) > 50 else text
-                    )
+                    if self.current_mode == 'transcribe':
+                        # Mode 1: Direct transcription
+                        set_clipboard_and_paste(text)
+                        rumps.notification(
+                            title="Voice Terminal",
+                            subtitle="Typed",
+                            message=text[:50] + "..." if len(text) > 50 else text
+                        )
+                    else:
+                        # Mode 2: Send to Claude
+                        response = self.call_llm(self.clipboard_context, text)
+                        set_clipboard_and_paste(response)
+                        rumps.notification(
+                            title="Voice Terminal",
+                            subtitle="Claude Response",
+                            message=response[:50] + "..." if len(response) > 50 else response
+                        )
                 else:
                     rumps.notification(
                         title="Voice Terminal",
@@ -229,11 +299,36 @@ class VoiceTerminalApp(rumps.App):
         finally:
             self.reset_status()
 
+    def call_llm(self, context: str, prompt: str) -> str:
+        """Send context + prompt to Claude and return response."""
+        if context:
+            user_message = f"Context:\n```\n{context}\n```\n\nRequest: {prompt}"
+        else:
+            user_message = prompt
+
+        response = self.llm_client.chat.completions.create(
+            model=self.llm_model,
+            max_tokens=4096,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant. The user may provide context (code, text, etc.) along with a spoken request. Respond concisely and directly - your response will be pasted into their editor or terminal."
+                },
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ]
+        )
+        return response.choices[0].message.content
+
     def reset_status(self):
         """Reset app status to ready state."""
         self.title = "🎤"
         self.menu["Status: Ready"].title = "Status: Ready"
         self.audio_data = []
+        self.current_mode = None
+        self.clipboard_context = None
 
 
 if __name__ == "__main__":
